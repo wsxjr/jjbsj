@@ -32,6 +32,9 @@ from cv_bridge import CvBridge, CvBridgeError
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
+from std_msgs.msg import Header
+
+from robomini_interfaces.msg import TargetDetection, TargetDetectionArray
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,8 @@ class TargetCandidate:
     radius: int
     dark_fraction: float
     blue_ratio: float
+    blue_pixels: int
+    circle_pixels: int
     state: str
     clipped: bool
 
@@ -55,6 +60,9 @@ class CameraViewNode(Node):
 
         # 图像话题默认使用仿真提供的相机原始图像。
         self.declare_parameter("image_topic", "/camera/image_raw")
+
+        # 每帧黑色圆和灯条识别结果发布到该话题。
+        self.declare_parameter("detection_topic", "/target_detections")
 
         # 窗口名称同时会显示在窗口标题栏中。
         self.declare_parameter("window_name", "ROBOMINI Camera")
@@ -100,6 +108,9 @@ class CameraViewNode(Node):
         self.declare_parameter("pending_blue_ratio", 0.095)
 
         self.image_topic = str(self.get_parameter("image_topic").value)
+        self.detection_topic = str(
+            self.get_parameter("detection_topic").value
+        )
         self.window_name = str(self.get_parameter("window_name").value)
         display_rate = max(
             1.0, float(self.get_parameter("display_rate_hz").value)
@@ -154,9 +165,16 @@ class CameraViewNode(Node):
         # cv_bridge 负责把 ROS Image 消息转换成 OpenCV 可以直接显示的数组。
         self.bridge = CvBridge()
         self._latest_image: Optional[np.ndarray] = None
+        self._latest_header: Optional[Header] = None
         self._window_created = False
         self._last_circle_count = -1
         self._last_state_counts = (-1, -1, -1, -1)
+
+        self.pub_detections = self.create_publisher(
+            TargetDetectionArray,
+            self.detection_topic,
+            10,
+        )
 
         # 传感器 QoS 更适合连续图像。它优先接收最新画面，不要求每帧都可靠重传。
         self.create_subscription(
@@ -171,6 +189,7 @@ class CameraViewNode(Node):
 
         self.get_logger().info(
             f"camera_view_node started: image={self.image_topic}, "
+            f"detections={self.detection_topic}, "
             f"display={display_rate:.0f}Hz; press Q or Esc to exit"
         )
 
@@ -186,6 +205,7 @@ class CameraViewNode(Node):
             return
 
         self._latest_image = np.asarray(image)
+        self._latest_header = msg.header
 
     def _show_latest_image(self) -> None:
         """检测黑色圆、判断蓝色灯态，并显示标注后的图像。"""
@@ -228,6 +248,8 @@ class CameraViewNode(Node):
                 2,
                 cv2.LINE_AA,
             )
+
+        self._publish_detections(circles)
 
         # 只在检测数量或分类数量变化时写日志，避免 30 Hz 刷屏。
         counts = tuple(state_counts[name] for name in (
@@ -378,6 +400,8 @@ class CameraViewNode(Node):
                     radius=int(radius),
                     dark_fraction=dark_fraction,
                     blue_ratio=blue_ratio,
+                    blue_pixels=blue_pixels,
+                    circle_pixels=circle_pixels,
                     state=state,
                     clipped=clipped,
                 )
@@ -398,6 +422,35 @@ class CameraViewNode(Node):
         mask = cv2.inRange(hsv, lower, upper)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    def _publish_detections(
+        self,
+        circles: List[TargetCandidate],
+    ) -> None:
+        """发布一帧内所有靶板的完整识别信息。
+
+        即使这一帧没有检测到靶板，也会发布空数组。下游节点可以通过消息的
+        header.stamp 和 header.frame_id 将识别结果与原始相机图像对应起来。
+        """
+        message = TargetDetectionArray()
+        if self._latest_header is not None:
+            message.header.stamp = self._latest_header.stamp
+            message.header.frame_id = self._latest_header.frame_id
+
+        for target in circles:
+            detection = TargetDetection()
+            detection.center_x = float(target.center_x)
+            detection.center_y = float(target.center_y)
+            detection.radius = float(target.radius)
+            detection.dark_fraction = float(target.dark_fraction)
+            detection.blue_ratio = float(target.blue_ratio)
+            detection.blue_pixels = int(target.blue_pixels)
+            detection.circle_pixels = int(target.circle_pixels)
+            detection.state = target.state
+            detection.clipped = bool(target.clipped)
+            message.detections.append(detection)
+
+        self.pub_detections.publish(message)
 
     def _classify_blue_ratio(self, blue_ratio: float) -> str:
         """根据归一化蓝色面积比例判断灯条状态。

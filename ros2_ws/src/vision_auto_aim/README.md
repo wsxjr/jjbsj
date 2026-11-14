@@ -21,6 +21,29 @@ off / active / pending / unknown
 
 It has no gimbal control or firing logic.
 
+## Published detections
+
+Every processed camera frame publishes:
+
+```text
+/target_detections  robomini_interfaces/TargetDetectionArray
+```
+
+The array header reuses the original camera timestamp and frame ID. Each
+detection contains:
+
+```text
+center_x, center_y, radius
+dark_fraction
+blue_ratio
+blue_pixels, circle_pixels
+state
+clipped
+```
+
+An empty detection array means that the frame was processed but no target was
+detected.
+
 ## Run
 
 Start the simulator first, then run:
