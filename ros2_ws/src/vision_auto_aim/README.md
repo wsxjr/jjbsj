@@ -1,45 +1,33 @@
 # vision_auto_aim
 
-`vision_auto_aim` is a Python ROS 2 package containing a starter node for the
-ROBOMINI auto-aim simulation.
+This package currently contains one node:
 
-## Implement the detector
-
-Edit `vision_auto_aim/auto_aim_node.py` and replace `detect_target()`:
-
-```python
-def detect_target(self, image_bgr):
-    # Run the detector here.
-    return Detection(u=target_x, v=target_y, confidence=score)
+```text
+camera_view_node
 ```
 
-The node already handles:
+It subscribes to the simulator camera and displays the latest image in an
+OpenCV window. It has no target detection, gimbal control, or firing logic.
 
-- camera image and intrinsic subscriptions;
-- gimbal feedback validation;
-- pixel offset to absolute yaw/pitch conversion;
-- gimbal limit clamping;
-- stale image/feedback/target safety timeouts;
-- optional firing after alignment.
+## Run
 
-The placeholders are intentionally inert. In particular, firing is disabled by
-default:
+Start the simulator first, then run:
 
 ```bash
-ros2 run vision_auto_aim auto_aim_node
+ros2 run vision_auto_aim camera_view_node
 ```
 
-After the detector and control signs have been verified, enable firing with:
+The default image topic is:
+
+```text
+/camera/image_raw
+```
+
+Press `Q`, press `Esc`, or close the image window to stop the viewer.
+
+The topic can be changed with a ROS parameter:
 
 ```bash
-ros2 run vision_auto_aim auto_aim_node --ros-args -p enable_fire:=true
+ros2 run vision_auto_aim camera_view_node \
+  --ros-args -p image_topic:=/some/other/image
 ```
-
-Useful topics:
-
-| Direction | Topic | Type |
-|---|---|---|
-| input | `/camera/image_raw` | `sensor_msgs/Image` |
-| input | `/camera/camera_info` | `sensor_msgs/CameraInfo` |
-| input | `/gimbal_to_vision` | `robomini_interfaces/GimbalToVision` |
-| output | `/vision_to_gimbal` | `robomini_interfaces/VisionToGimbal` |

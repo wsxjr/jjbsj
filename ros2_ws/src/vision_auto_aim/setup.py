@@ -14,12 +14,12 @@ setup(
     zip_safe=True,
     maintainer="robomini-team",
     maintainer_email="robomini-team@robomini.local",
-    description="Python auto-aim algorithm template for the ROBOMINI simulation platform.",
+    description="ROS 2 camera viewer for the ROBOMINI simulation platform.",
     license="Apache-2.0",
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
-            "auto_aim_node = vision_auto_aim.auto_aim_node:main",
+            "camera_view_node = vision_auto_aim.camera_view_node:main",
         ],
     },
 )

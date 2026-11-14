@@ -1,1 +1,1 @@
-"""ROBOMINI auto-aim algorithm package."""
+"""ROBOMINI camera viewer package."""
