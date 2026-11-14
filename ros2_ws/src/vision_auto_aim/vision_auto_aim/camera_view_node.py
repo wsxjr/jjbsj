@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
-"""订阅相机图像，检测黑色圆形靶板并显示检测结果。
+"""订阅相机图像，检测黑色圆形靶板并区分蓝色灯条状态。
 
 这个节点只做一件事：
 
-    /camera/image_raw -> 黑色圆检测 -> 红色矩形框 -> OpenCV 窗口
+    /camera/image_raw -> 黑色圆检测 -> 蓝色面积比例 -> OpenCV 显示
 
-它不检测目标、不控制云台、不发布控制命令。按 Q 或 Esc，或者关闭图像窗口，
-都可以结束节点。
+每个黑色圆内部会计算：
+
+    blue_ratio = 蓝色像素数 / 靶板圆内部总像素数
+
+根据 blue_ratio 判断：
+
+* off：没有蓝色灯条；
+* active：有两根蓝色灯条，比例较低；
+* pending：有四根蓝色灯条，比例较高；
+* unknown：比例落在过渡区，暂时不强行分类。
+
+节点不控制云台、不发布控制命令。按 Q 或 Esc，或者关闭图像窗口，都可以
+结束节点。
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -22,8 +34,21 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 
+@dataclass(frozen=True)
+class TargetCandidate:
+    """一个黑色靶板及其蓝色面积分类结果。"""
+
+    center_x: int
+    center_y: int
+    radius: int
+    dark_fraction: float
+    blue_ratio: float
+    state: str
+    clipped: bool
+
+
 class CameraViewNode(Node):
-    """接收相机图像，检测黑色圆形并使用红色矩形显示。"""
+    """接收相机图像，检测黑色圆并按蓝色面积比例判断灯条状态。"""
 
     def __init__(self) -> None:
         super().__init__("camera_view_node")
@@ -56,6 +81,24 @@ class CameraViewNode(Node):
         # 这样可以过滤掉场地背景上的普通圆形边缘。
         self.declare_parameter("min_dark_fraction", 0.65)
 
+        # 蓝色灯条的 HSV 范围。当前仿真中灯条的 H 约为 101，
+        # S 和 V 都较高，因此这里采用较宽的蓝色范围。
+        self.declare_parameter("blue_hue_min", 85)
+        self.declare_parameter("blue_hue_max", 140)
+        self.declare_parameter("blue_saturation_min", 100)
+        self.declare_parameter("blue_value_min", 80)
+
+        # 蓝色面积比例分类阈值。比例是蓝色像素数除以整个靶板圆面积，
+        # 不受靶板远近造成的绝对像素面积变化影响。
+        #
+        # 根据当前仿真：
+        #   off     ≈ 0
+        #   active  ≈ 0.06
+        #   pending ≈ 0.12
+        self.declare_parameter("off_blue_ratio", 0.015)
+        self.declare_parameter("active_blue_ratio", 0.025)
+        self.declare_parameter("pending_blue_ratio", 0.095)
+
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.window_name = str(self.get_parameter("window_name").value)
         display_rate = max(
@@ -83,12 +126,37 @@ class CameraViewNode(Node):
             0.0,
             min(1.0, float(self.get_parameter("min_dark_fraction").value)),
         )
+        self.blue_hue_min = max(
+            0, min(179, int(self.get_parameter("blue_hue_min").value))
+        )
+        self.blue_hue_max = max(
+            self.blue_hue_min,
+            min(179, int(self.get_parameter("blue_hue_max").value)),
+        )
+        self.blue_saturation_min = max(
+            0, min(255, int(self.get_parameter("blue_saturation_min").value))
+        )
+        self.blue_value_min = max(
+            0, min(255, int(self.get_parameter("blue_value_min").value))
+        )
+        self.off_blue_ratio = max(
+            0.0, float(self.get_parameter("off_blue_ratio").value)
+        )
+        self.active_blue_ratio = max(
+            self.off_blue_ratio,
+            float(self.get_parameter("active_blue_ratio").value),
+        )
+        self.pending_blue_ratio = max(
+            self.active_blue_ratio,
+            float(self.get_parameter("pending_blue_ratio").value),
+        )
 
         # cv_bridge 负责把 ROS Image 消息转换成 OpenCV 可以直接显示的数组。
         self.bridge = CvBridge()
         self._latest_image: Optional[np.ndarray] = None
         self._window_created = False
         self._last_circle_count = -1
+        self._last_state_counts = (-1, -1, -1, -1)
 
         # 传感器 QoS 更适合连续图像。它优先接收最新画面，不要求每帧都可靠重传。
         self.create_subscription(
@@ -120,25 +188,61 @@ class CameraViewNode(Node):
         self._latest_image = np.asarray(image)
 
     def _show_latest_image(self) -> None:
-        """检测黑色圆并显示带红色矩形框的最新图像。"""
+        """检测黑色圆、判断蓝色灯态，并显示标注后的图像。"""
         if self._latest_image is None:
             return
 
+        hsv = cv2.cvtColor(self._latest_image, cv2.COLOR_BGR2HSV)
+        blue_mask = self._create_blue_mask(hsv)
         annotated = self._latest_image.copy()
-        circles = self._detect_black_circles(self._latest_image)
-        for x, y, radius, _dark_fraction in circles:
+        circles = self._detect_black_circles(hsv, blue_mask)
+
+        state_counts = {
+            "pending": 0,
+            "active": 0,
+            "off": 0,
+            "unknown": 0,
+        }
+        for target in circles:
+            state_counts[target.state] += 1
             cv2.rectangle(
                 annotated,
-                (x - radius, y - radius),
-                (x + radius, y + radius),
+                (target.center_x - target.radius, target.center_y - target.radius),
+                (target.center_x + target.radius, target.center_y + target.radius),
                 (0, 0, 255),
                 3,
             )
 
-        # 只在数量变化时写日志，避免 30 Hz 刷屏。
-        if len(circles) != self._last_circle_count:
-            self.get_logger().info(f"detected black circles: {len(circles)}")
+            label = f"{target.state} {target.blue_ratio:.3f}"
+            label_x = max(0, target.center_x - target.radius)
+            label_y = target.center_y - target.radius - 8
+            if label_y < 18:
+                label_y = target.center_y - target.radius + 20
+            cv2.putText(
+                annotated,
+                label,
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                self._state_label_color(target.state),
+                2,
+                cv2.LINE_AA,
+            )
+
+        # 只在检测数量或分类数量变化时写日志，避免 30 Hz 刷屏。
+        counts = tuple(state_counts[name] for name in (
+            "pending", "active", "off", "unknown"
+        ))
+        if len(circles) != self._last_circle_count or counts != self._last_state_counts:
+            self.get_logger().info(
+                f"detected black circles: {len(circles)}; "
+                f"pending={state_counts['pending']}, "
+                f"active={state_counts['active']}, "
+                f"off={state_counts['off']}, "
+                f"unknown={state_counts['unknown']}"
+            )
             self._last_circle_count = len(circles)
+            self._last_state_counts = counts
 
         try:
             if not self._window_created:
@@ -169,20 +273,19 @@ class CameraViewNode(Node):
 
     def _detect_black_circles(
         self,
-        image_bgr: np.ndarray,
-    ) -> List[Tuple[int, int, int, float]]:
-        """检测图像中的黑色圆形，返回圆心、半径和圆内暗色比例。
+        hsv: np.ndarray,
+        blue_mask: np.ndarray,
+    ) -> List[TargetCandidate]:
+        """检测黑色圆形，并计算每个圆内部的蓝色面积比例。
 
         检测分为两步：
 
         1. 使用 HSV 的 V 通道和 HoughCircles 找出圆形边缘；
         2. 检查圆心附近的像素是否足够黑，过滤地板等非黑色圆形。
 
-        返回值的格式为：
-
-            [(center_x, center_y, radius, dark_fraction), ...]
+        对通过黑色检查的圆，再统计整个靶板圆内部的蓝色像素比例。使用比例
+        而不是绝对面积，可以让远近不同的靶板使用同一组分类阈值。
         """
-        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
         value = hsv[:, :, 2]
 
         # 轻微模糊圆形边缘中的十字图案和抗锯齿，让 Hough 检测更稳定。
@@ -201,7 +304,7 @@ class CameraViewNode(Node):
             return []
 
         height, width = value.shape
-        accepted: List[Tuple[int, int, int, float]] = []
+        accepted: List[TargetCandidate] = []
         for center_x, center_y, radius in np.round(raw_circles[0]).astype(int):
             # 只采样圆内部约 75% 的区域。靶板外圈和金属支架不参与判断，
             # 因此暗色比例更能代表靶板本身。
@@ -230,11 +333,102 @@ class CameraViewNode(Node):
             if dark_fraction < self.min_dark_fraction:
                 continue
 
+            # 蓝色比例使用完整靶板圆作为分母。圆超出图像边界时比例会失真，
+            # 因此把 clipped 标出来，并将状态设为 unknown。
+            circle_left = max(0, center_x - radius)
+            circle_right = min(width, center_x + radius + 1)
+            circle_top = max(0, center_y - radius)
+            circle_bottom = min(height, center_y + radius + 1)
+            circle_yy, circle_xx = np.ogrid[
+                circle_top:circle_bottom,
+                circle_left:circle_right,
+            ]
+            full_disk_mask = (
+                (circle_xx - center_x) ** 2 + (circle_yy - center_y) ** 2
+                <= radius**2
+            )
+            circle_blue = blue_mask[
+                circle_top:circle_bottom,
+                circle_left:circle_right,
+            ]
+            circle_pixels = int(np.count_nonzero(full_disk_mask))
+            if circle_pixels == 0:
+                continue
+            blue_pixels = int(
+                np.count_nonzero(circle_blue[full_disk_mask] > 0)
+            )
+            blue_ratio = float(blue_pixels) / float(circle_pixels)
+
+            clipped = (
+                center_x - radius < 0
+                or center_y - radius < 0
+                or center_x + radius >= width
+                or center_y + radius >= height
+            )
+            state = (
+                "unknown"
+                if clipped
+                else self._classify_blue_ratio(blue_ratio)
+            )
+
             accepted.append(
-                (int(center_x), int(center_y), int(radius), dark_fraction)
+                TargetCandidate(
+                    center_x=int(center_x),
+                    center_y=int(center_y),
+                    radius=int(radius),
+                    dark_fraction=dark_fraction,
+                    blue_ratio=blue_ratio,
+                    state=state,
+                    clipped=clipped,
+                )
             )
 
         return accepted
+
+    def _create_blue_mask(self, hsv: np.ndarray) -> np.ndarray:
+        """提取蓝色灯条，并清除面积很小的零散噪声。"""
+        lower = np.array(
+            [self.blue_hue_min, self.blue_saturation_min, self.blue_value_min],
+            dtype=np.uint8,
+        )
+        upper = np.array(
+            [self.blue_hue_max, 255, 255],
+            dtype=np.uint8,
+        )
+        mask = cv2.inRange(hsv, lower, upper)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    def _classify_blue_ratio(self, blue_ratio: float) -> str:
+        """根据归一化蓝色面积比例判断灯条状态。
+
+        阈值之间特意留出过渡区：
+
+        * 小于 off_blue_ratio：off
+        * active_blue_ratio 到 pending_blue_ratio 之间：active
+        * 大于 pending_blue_ratio：pending
+        * 落在两个阈值中间的狭窄区间：unknown
+
+        这样可以避免单帧噪声让状态在 active 和 pending 之间来回跳。
+        """
+        if blue_ratio >= self.pending_blue_ratio:
+            return "pending"
+        if blue_ratio >= self.active_blue_ratio:
+            return "active"
+        if blue_ratio <= self.off_blue_ratio:
+            return "off"
+        return "unknown"
+
+    @staticmethod
+    def _state_label_color(state: str):
+        """返回不同灯态的文字颜色。红色矩形本身保持不变。"""
+        if state == "pending":
+            return (0, 255, 0)
+        if state == "active":
+            return (0, 255, 255)
+        if state == "off":
+            return (200, 200, 200)
+        return (0, 165, 255)
 
 
 def main(args=None) -> None:
