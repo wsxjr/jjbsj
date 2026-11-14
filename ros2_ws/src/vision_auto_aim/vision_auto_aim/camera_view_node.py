@@ -32,7 +32,7 @@ from cv_bridge import CvBridge, CvBridgeError
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 
 from robomini_interfaces.msg import TargetDetection, TargetDetectionArray
 
@@ -63,6 +63,9 @@ class CameraViewNode(Node):
 
         # 每帧黑色圆和灯条识别结果发布到该话题。
         self.declare_parameter("detection_topic", "/target_detections")
+
+        # 跟踪状态由 target_tracker 发布，在窗口左上角显示。
+        self.declare_parameter("tracker_state_topic", "/tracker_state")
 
         # 窗口名称同时会显示在窗口标题栏中。
         self.declare_parameter("window_name", "ROBOMINI Camera")
@@ -110,6 +113,9 @@ class CameraViewNode(Node):
         self.image_topic = str(self.get_parameter("image_topic").value)
         self.detection_topic = str(
             self.get_parameter("detection_topic").value
+        )
+        self.tracker_state_topic = str(
+            self.get_parameter("tracker_state_topic").value
         )
         self.window_name = str(self.get_parameter("window_name").value)
         display_rate = max(
@@ -169,6 +175,8 @@ class CameraViewNode(Node):
         self._window_created = False
         self._last_circle_count = -1
         self._last_state_counts = (-1, -1, -1, -1)
+        self._tracker_state = "WAITING"
+        self._tracker_state_time = -1.0e9
 
         self.pub_detections = self.create_publisher(
             TargetDetectionArray,
@@ -182,6 +190,12 @@ class CameraViewNode(Node):
             self.image_topic,
             self._on_image,
             qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            String,
+            self.tracker_state_topic,
+            self._on_tracker_state,
+            10,
         )
 
         # 显示操作放在定时器中，避免相机每个回调都操作一次窗口。
@@ -206,6 +220,13 @@ class CameraViewNode(Node):
 
         self._latest_image = np.asarray(image)
         self._latest_header = msg.header
+
+    def _on_tracker_state(self, msg: String) -> None:
+        """接收跟踪状态，用于在画面左上角显示。"""
+        self._tracker_state = msg.data.strip() or "UNKNOWN"
+        self._tracker_state_time = (
+            float(self.get_clock().now().nanoseconds) * 1.0e-9
+        )
 
     def _show_latest_image(self) -> None:
         """检测黑色圆、判断蓝色灯态，并显示标注后的图像。"""
@@ -249,6 +270,7 @@ class CameraViewNode(Node):
                 cv2.LINE_AA,
             )
 
+        self._draw_tracker_state(annotated)
         self._publish_detections(circles)
 
         # 只在检测数量或分类数量变化时写日志，避免 30 Hz 刷屏。
@@ -482,6 +504,54 @@ class CameraViewNode(Node):
         if state == "off":
             return (200, 200, 200)
         return (0, 165, 255)
+
+    def _draw_tracker_state(self, image: np.ndarray) -> None:
+        """在画面左上角绘制状态背景和文字。"""
+        now = float(self.get_clock().now().nanoseconds) * 1.0e-9
+        state = self._tracker_state
+        if now - self._tracker_state_time > 2.0:
+            state = "OFFLINE"
+
+        text = f"TRACKER: {state}"
+        scale = 0.9
+        thickness = 2
+        color = self._tracker_state_color(state)
+        (text_width, text_height), baseline = cv2.getTextSize(
+            text,
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            thickness,
+        )
+        left, top = 12, 12
+        right = left + text_width + 20
+        bottom = top + text_height + baseline + 18
+        cv2.rectangle(image, (left, top), (right, bottom), (20, 20, 20), -1)
+        cv2.putText(
+            image,
+            text,
+            (left + 10, top + text_height + 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+    @staticmethod
+    def _tracker_state_color(state: str):
+        if state == "READY":
+            return (0, 255, 0)
+        if state == "AIMING":
+            return (0, 255, 255)
+        if state == "FIRE":
+            return (0, 0, 255)
+        if state == "RETURN":
+            return (255, 180, 0)
+        if state == "CALIBRATING":
+            return (255, 255, 0)
+        if state == "CENTERING":
+            return (255, 120, 0)
+        return (180, 180, 180)
 
 
 def main(args=None) -> None:
