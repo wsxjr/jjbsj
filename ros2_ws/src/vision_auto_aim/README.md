@@ -6,8 +6,9 @@ This package currently contains one node:
 camera_view_node
 ```
 
-It subscribes to the simulator camera and displays the latest image in an
-OpenCV window. It has no target detection, gimbal control, or firing logic.
+It subscribes to the simulator camera, detects black circular target plates,
+draws a red rectangle around each detection, and displays the result in an
+OpenCV window. It has no gimbal control or firing logic.
 
 ## Run
 
@@ -30,4 +31,15 @@ The topic can be changed with a ROS parameter:
 ```bash
 ros2 run vision_auto_aim camera_view_node \
   --ros-args -p image_topic:=/some/other/image
+```
+
+The black-circle detector can be tuned with:
+
+```bash
+ros2 run vision_auto_aim camera_view_node --ros-args \
+  -p black_value_threshold:=80 \
+  -p min_radius_px:=45 \
+  -p max_radius_px:=70 \
+  -p min_dark_fraction:=0.65 \
+  -p hough_circle_threshold:=42
 ```
