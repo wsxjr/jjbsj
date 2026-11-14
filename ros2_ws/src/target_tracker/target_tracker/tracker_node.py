@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""小能量机关状态机跟踪节点。
+"""小/大能量机关状态机跟踪节点。
 
 策略：
 
 * CALIBRATING：保持当前姿态，采样所有旋转靶板的圆心；
 * CENTERING：根据拟合圆把云台移动到真正的旋转中心；
 * READY：停在机关中心，等待 pending 目标突然切换；
-* AIMING：根据匀速圆周运动，预测目标在射击提前量后的位置并转动云台；
+* AIMING：按当前小机关或大机关运动模型，预测射击提前量后的位置；
 * FIRE：云台到位后只发送一次 mode=2；
 * RETURN：回到机关中心，然后重新进入 READY。
 
-当前版本使用小型能量机关的已知角速度 pi/3 rad/s。靶板运动中心、图像
-运动半径和初始相位在 CALIBRATING 阶段从视觉检测结果中采样得到。
+小机关使用 pi/3 rad/s 恒定角速度；大机关使用裁判下发的 a、omega、t0
+计算正弦变化角速度。两种模式共用同一个云台中心、运动和射击状态机。
 """
 
 from __future__ import annotations
 
 import math
+import json
 from typing import Optional, Tuple
 
 import numpy as np
@@ -28,6 +29,7 @@ from std_msgs.msg import String
 
 from robomini_interfaces.msg import (
     GimbalToVision,
+    RuneState,
     TargetDetectionArray,
     VisionToGimbal,
 )
@@ -45,7 +47,7 @@ STATE_RETURN = "RETURN"
 
 
 class TrackerNode(Node):
-    """小机关“中心待机、换靶预测、单发、回中心”状态机。"""
+    """小/大机关共用的中心待机、预测瞄准和射击状态机。"""
 
     def __init__(self) -> None:
         super().__init__("target_tracker_node")
@@ -54,6 +56,9 @@ class TrackerNode(Node):
         self.declare_parameter("camera_info_topic", "/camera/camera_info")
         self.declare_parameter("feedback_topic", "/gimbal_to_vision")
         self.declare_parameter("command_topic", "/vision_to_gimbal")
+        self.declare_parameter("side", "blue")
+        self.declare_parameter("rune_state_topic", "/rune/state")
+        self.declare_parameter("rune_mode_topic", "/rune/blue/mode")
 
         self.declare_parameter("control_rate_hz", 50.0)
         self.declare_parameter("target_state", "pending")
@@ -113,6 +118,21 @@ class TrackerNode(Node):
         )
         self.command_topic = str(
             self.get_parameter("command_topic").value
+        )
+        self.side = str(self.get_parameter("side").value)
+        if self.side not in ("blue", "red"):
+            raise RuntimeError(f"side must be blue or red, got {self.side!r}")
+        self.rune_state_topic = str(
+            self.get_parameter("rune_state_topic").value
+        )
+        default_mode_topic = f"/rune/{self.side}/mode"
+        mode_topic_param = str(
+            self.get_parameter("rune_mode_topic").value
+        )
+        self.rune_mode_topic = (
+            mode_topic_param
+            if mode_topic_param and mode_topic_param != "/rune/blue/mode"
+            else default_mode_topic
         )
         self.state_topic = str(
             self.get_parameter("state_topic").value
@@ -264,6 +284,11 @@ class TrackerNode(Node):
         self._aim_yaw_vel = 0.0
         self._aim_pitch_vel = 0.0
         self._last_state_publish = -1.0e9
+        self._motion_mode = "small"
+        self._rune_speed = 0.0
+        self._big_a: Optional[float] = None
+        self._big_omega: Optional[float] = None
+        self._big_t0: Optional[float] = None
 
         self.pub_command = self.create_publisher(
             VisionToGimbal,
@@ -293,10 +318,23 @@ class TrackerNode(Node):
             self._on_feedback,
             10,
         )
+        self.create_subscription(
+            RuneState,
+            self.rune_state_topic,
+            self._on_rune_state,
+            10,
+        )
+        self.create_subscription(
+            String,
+            self.rune_mode_topic,
+            self._on_rune_mode,
+            10,
+        )
         self.create_timer(1.0 / control_rate, self._control_loop)
 
         self.get_logger().info(
-            f"small-rune tracker started: home=({math.degrees(self.home_yaw):.2f}, "
+            f"rune tracker started: side={self.side}, "
+            f"home=({math.degrees(self.home_yaw):.2f}, "
             f"{math.degrees(self.home_pitch):.2f})deg, "
             f"omega={self.omega:.6f}rad/s, "
             f"lead={self.shot_lead_time:.3f}s, "
@@ -333,6 +371,53 @@ class TrackerNode(Node):
     def _on_feedback(self, msg: GimbalToVision) -> None:
         self._feedback = msg
         self._feedback_time = self._now()
+
+    def _on_rune_state(self, msg: RuneState) -> None:
+        """从裁判状态获取当前模式和瞬时角速度。"""
+        if msg.mode in ("small", "big"):
+            if self._motion_mode != msg.mode:
+                self.get_logger().info(f"rune mode changed: {msg.mode}")
+            self._motion_mode = msg.mode
+        self._rune_speed = float(msg.speed)
+
+    def _on_rune_mode(self, msg: String) -> None:
+        """解析大机关命令中的 a、omega 和 t0。"""
+        try:
+            data = json.loads(msg.data)
+        except (TypeError, ValueError) as exc:
+            self.get_logger().warning(f"cannot parse rune mode JSON: {exc}")
+            return
+
+        mode = str(data.get("mode", ""))
+        if mode in ("small", "big"):
+            self._motion_mode = mode
+        if mode != "big":
+            return
+
+        try:
+            a = float(data["a"])
+            omega = float(data["omega"])
+            t0 = float(data["t0"])
+        except (KeyError, TypeError, ValueError) as exc:
+            self.get_logger().warning(f"invalid big-rune parameters: {exc}")
+            return
+        if not all(math.isfinite(v) for v in (a, omega, t0)):
+            return
+        if abs(omega) < 1.0e-9:
+            return
+
+        if (
+            self._big_a != a
+            or self._big_omega != omega
+            or self._big_t0 != t0
+        ):
+            self._big_a = a
+            self._big_omega = omega
+            self._big_t0 = t0
+            self.get_logger().info(
+                f"big-rune parameters: a={a:.6f}, "
+                f"omega={omega:.6f}rad/s, t0={t0:.3f}s"
+            )
 
     def _control_loop(self) -> None:
         now = self._now()
@@ -692,13 +777,7 @@ class TrackerNode(Node):
         return True
 
     def _run_aiming(self, now: float) -> None:
-        elapsed = now - self._switch_time
-        phase = (
-            self._switch_phase
-            + self.omega_sign
-            * self.omega
-            * (elapsed + self.shot_lead_time)
-        )
+        phase, phase_rate = self._predict_phase(now)
         pixel_x = self._orbit_center_x + self._orbit_radius * math.cos(phase)
         pixel_y = self._orbit_center_y + self._orbit_radius * math.sin(phase)
         (
@@ -709,7 +788,7 @@ class TrackerNode(Node):
         ) = self._pixel_to_home_angles(
             pixel_x,
             pixel_y,
-            phase_rate=self.omega_sign * self.omega,
+            phase_rate=phase_rate,
         )
         self._publish_aim(
             self._aim_yaw,
@@ -739,6 +818,47 @@ class TrackerNode(Node):
                 "aim timeout; returning to rune centre"
             )
             self._enter_state(STATE_RETURN, now)
+
+    def _predict_phase(self, now: float) -> Tuple[float, float]:
+        """计算 ``now + shot_lead_time`` 时刻的目标相位和角速度。"""
+        future_time = now + self.shot_lead_time
+        elapsed = future_time - self._switch_time
+
+        if self._motion_mode == "small":
+            phase_rate = self.omega_sign * self.omega
+            phase = self._switch_phase + phase_rate * elapsed
+            return phase, phase_rate
+
+        if (
+            self._big_a is not None
+            and self._big_omega is not None
+            and self._big_t0 is not None
+        ):
+            a = self._big_a
+            omega = self._big_omega
+            t0 = self._big_t0
+            phase_at_switch = omega * (self._switch_time - t0)
+            phase_at_future = omega * (future_time - t0)
+            integrated_speed = (
+                (2.090 - a) * elapsed
+                + (a / omega)
+                * (
+                    math.cos(phase_at_switch)
+                    - math.cos(phase_at_future)
+                )
+            )
+            phase = (
+                self._switch_phase
+                + self.omega_sign * integrated_speed
+            )
+            current_speed = (
+                a * math.sin(phase_at_future) + (2.090 - a)
+            )
+            return phase, self.omega_sign * current_speed
+
+        # 模式命令尚未到达时，使用裁判状态中的瞬时速度做短时预测。
+        phase_rate = self.omega_sign * self._rune_speed
+        return self._switch_phase + phase_rate * elapsed, phase_rate
 
     def _run_fire_hold(self, now: float) -> None:
         if now - self._state_started >= self.fire_hold_time:

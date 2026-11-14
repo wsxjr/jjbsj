@@ -1,6 +1,6 @@
 # target_tracker
 
-The `tracker_node` implements the small-rune state machine:
+The `tracker_node` implements the small/big-rune state machine:
 
 ```text
 CALIBRATING -> CENTERING -> READY -> AIMING -> FIRE -> RETURN -> READY
@@ -82,7 +82,15 @@ Keep the rune stationary while testing target selection:
 ros2 launch target_tracker auto_aim.launch.py start_small_rune:=false
 ```
 
-The small-rune angular speed is fixed to `pi/3 rad/s`. The target orbit centre,
+The small rune uses angular speed `pi/3 rad/s`. The big rune uses:
+
+```text
+speed(t) = a * sin(omega * (t - t0)) + (2.090 - a)
+```
+
+The mode and instantaneous state come from `/rune/state`; `a`, `omega`, and
+`t0` come from `/rune/<side>/mode`. Both rune types share the same calibrated
+centre, state machine, prediction, and firing logic. The target orbit centre,
 radius, and phase are sampled during calibration. The manual home angles are
 only the initial sampling pose and fallback, not the final aiming centre.
 `shot_lead_time_sec` is

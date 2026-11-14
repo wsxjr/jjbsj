@@ -139,6 +139,7 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "use_sim_time": True,
+                "side": ParameterValue(side, value_type=str),
                 "home_yaw_deg": ParameterValue(
                     home_yaw_deg,
                     value_type=float,
